@@ -1,6 +1,7 @@
 from backlash._compat import string_types, bytes_
 from backlash.tbtools import get_current_traceback
 from backlash.utils import RequestContext
+from pymongo.errors import AutoReconnect
 
 import logging
 log = logging.getLogger()
@@ -63,11 +64,54 @@ class TraceErrorsMiddleware(object):
 
             for chunk in self._report_errors_with_response(environ, start_response):
                 yield chunk
+                
+    def setup_ming(self):
+        """Setup MongoDB database engine using Ming"""
+        from tg import config
+        from tg.configuration.utils import coerce_config
+        from tg.support.converters import asbool, asint
+
+        try:
+            from ming import create_datastore
+            def create_ming_datastore(url, database, **kw):
+                if database and url[-1] != '/':
+                    url += '/'
+                ming_url = url + database
+                return create_datastore(ming_url, **kw)
+        except ImportError: #pragma: no cover
+            from ming.datastore import DataStore
+            def create_ming_datastore(url, database, **kw):
+                return DataStore(url, database, **kw)
+
+        def mongo_read_pref(value):
+            from pymongo.read_preferences import ReadPreference
+            return getattr(ReadPreference, value)
+
+        datastore_options = coerce_config(config, 'ming.connection.', {'max_pool_size':asint,
+                                                                       'network_timeout':asint,
+                                                                       'tz_aware':asbool,
+                                                                       'safe':asbool,
+                                                                       'journal':asbool,
+                                                                       'wtimeout':asint,
+                                                                       'fsync':asbool,
+                                                                       'ssl':asbool,
+                                                                       'read_preference':mongo_read_pref})
+        datastore_options.pop('host', None)
+        datastore_options.pop('port', None)
+
+        datastore = create_ming_datastore(config['ming.url'], config.get('ming.db', ''), **datastore_options)
+        config['tg.app_globals'].ming_datastore = datastore
 
     def __call__(self, environ, start_response):
         app_iter = None
         try:
             app_iter = self.app(environ, start_response)
+        except AutoReconnect:
+            try:
+                self.setup_ming()
+                app_iter = self.app(environ, start_response)
+            except Exception:
+                return list(self._report_errors_with_response(environ, start_response))
         except Exception:
             return list(self._report_errors_with_response(environ, start_response))
         else:
